@@ -1,0 +1,483 @@
+from machine import Pin, I2C, ADC, PWM, Timer
+import network
+import time
+import socket
+
+SSID = "Krishsphone"
+PASSWORD = "waterbottle"
+
+wlan = network.WLAN(network.STA_IF)
+wlan.active(True)
+
+while not wlan.isconnected():
+    print("Connecting...")
+    wlan.connect(SSID, PASSWORD)
+    time.sleep(5)
+
+PICO_IP = wlan.ifconfig()[0]
+
+print("Connected!")
+print("Pico IP:", PICO_IP)
+print("Power URL: http://" + PICO_IP + "/pout")
+
+server = socket.socket()
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(("0.0.0.0", 80))
+server.listen(1)
+server.setblocking(False)
+
+print("Web server running")
+print("Poll this from Flask: http://" + PICO_IP + "/pout")
+
+va_pin = ADC(Pin(28))
+vb_pin = ADC(Pin(26))
+vpot_pin = ADC(Pin(27))
+OL_CL_pin = Pin(12, Pin.IN, Pin.PULL_UP)
+BU_BO_pin = Pin(2, Pin.IN, Pin.PULL_UP)
+
+ina_i2c = I2C(0, scl=Pin(1), sda=Pin(0), freq=400000)
+ina_i2c_2 = I2C(1, scl=Pin(19), sda=Pin(18), freq=400000)
+
+pwm = PWM(Pin(9))
+pwm.freq(100000)
+
+min_pwm = 0
+max_pwm = 64536
+pwm_out = min_pwm
+pwm_ref = 30000
+
+trip = 0
+OC = 0
+
+v_pot_filt = [0.0] * 100
+v_pot_index = 0
+
+v_ref = 0.0
+v_err = 0.0
+v_err_int = 0.0
+v_pi_out = 0.0
+
+kp = 100
+ki = 30
+
+SHUNT_OHMS = 0.10
+VBUS_NOM = 12.0
+
+IL2_FILT_LEN = 50
+il2_buf = [0.0] * IL2_FILT_LEN
+il2_idx = 0
+
+MPPT_INTERVAL = 300
+MPPT_TOL = 1000
+MPPT_PROBE_AVG = 100
+
+VA_RESTART_THRESHOLD = 0.75
+VA_RESTART_COUNT_REQUIRED = 300
+VA_RESTART_COOLDOWN = 3000
+
+va_change_count = 0
+
+ts_lo = 0
+ts_hi = 60000
+ts_state = "IDLE"
+ts_m1 = 0
+ts_m2 = 0
+ts_pwr1 = 0.0
+ts_pwr2 = 0.0
+ts_cnt = 0
+mppt_duty = 0
+mppt_tick = 0
+mppt_locked = False
+mppt_va_ref = None
+mppt_restart_cooldown = 0
+
+pout = 0.0
+
+timer_elapsed = 0
+count = 0
+first_run = 1
+
+va = 0.0
+vb = 0.0
+duty = 0
+
+
+def saturate(signal, upper, lower):
+    if signal > upper:
+        signal = upper
+    if signal < lower:
+        signal = lower
+    return signal
+
+
+def tick(t):
+    global timer_elapsed
+    timer_elapsed = 1
+
+
+def handle_web_request():
+    global pout, va, vb, duty
+
+    try:
+        cl, addr = server.accept()
+    except OSError:
+        return
+
+    try:
+        cl.settimeout(1)
+        request = cl.recv(1024).decode()
+
+        if "GET /pout" in request:
+            body = str(pout)
+        elif "GET /data" in request:
+            body = '{{"pout": {}, "va": {}, "vb": {}, "duty": {}}}'.format(
+                pout, va, vb, duty
+            )
+        else:
+            body = "HELLO FROM PICO. Use /pout for power."
+
+        response = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/plain\r\n"
+            "Connection: close\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "\r\n"
+            + body
+        )
+
+        cl.sendall(response.encode())
+
+    except Exception as e:
+        print("Web error:", e)
+
+    try:
+        cl.close()
+    except:
+        pass
+
+
+class ina219:
+    REG_CONFIG = 0x00
+    REG_SHUNTVOLTAGE = 0x01
+    REG_BUSVOLTAGE = 0x02
+    REG_POWER = 0x03
+    REG_CURRENT = 0x04
+    REG_CALIBRATION = 0x05
+
+    def __init__(self, sr, address, maxi):
+        self.address = address
+        self.shunt = sr
+
+    def vshunt(self):
+        reg_bytes = ina_i2c.readfrom_mem(self.address, self.REG_SHUNTVOLTAGE, 2)
+        reg_value = int.from_bytes(reg_bytes, "big")
+
+        if reg_value > 32767:
+            reg_value -= 65536
+
+        return float(reg_value) * 1e-5
+
+    def vbus(self):
+        reg_bytes = ina_i2c.readfrom_mem(self.address, self.REG_BUSVOLTAGE, 2)
+        reg_value = int.from_bytes(reg_bytes, "big") >> 3
+        return float(reg_value) * 0.004
+
+    def configure(self):
+        ina_i2c.writeto_mem(self.address, self.REG_CONFIG, b"\x19\x9F")
+        ina_i2c.writeto_mem(self.address, self.REG_CALIBRATION, b"\x00\x00")
+
+
+class ina219_2:
+    REG_CONFIG = 0x00
+    REG_SHUNTVOLTAGE = 0x01
+    REG_BUSVOLTAGE = 0x02
+    REG_POWER = 0x03
+    REG_CURRENT = 0x04
+    REG_CALIBRATION = 0x05
+
+    def __init__(self, sr, address, maxi):
+        self.address = address
+        self.shunt = sr
+
+    def vshunt(self):
+        reg_bytes = ina_i2c_2.readfrom_mem(self.address, self.REG_SHUNTVOLTAGE, 2)
+        reg_value = int.from_bytes(reg_bytes, "big")
+
+        if reg_value > 32767:
+            reg_value -= 65536
+
+        return float(reg_value) * 1e-5
+
+    def vbus(self):
+        reg_bytes = ina_i2c_2.readfrom_mem(self.address, self.REG_BUSVOLTAGE, 2)
+        reg_value = int.from_bytes(reg_bytes, "big") >> 3
+        return float(reg_value) * 0.004
+
+    def configure(self):
+        ina_i2c_2.writeto_mem(self.address, self.REG_CONFIG, b"\x19\x9F")
+        ina_i2c_2.writeto_mem(self.address, self.REG_CALIBRATION, b"\x00\x00")
+
+
+def reset_mppt_sweep(current_va):
+    global ts_lo, ts_hi, ts_state, ts_m1, ts_m2
+    global ts_pwr1, ts_pwr2, ts_cnt, mppt_tick
+    global mppt_locked, mppt_va_ref
+
+    ts_lo = 0
+    ts_hi = 60000
+    ts_state = "IDLE"
+    ts_m1 = 0
+    ts_m2 = 0
+    ts_pwr1 = 0.0
+    ts_pwr2 = 0.0
+    ts_cnt = 0
+    mppt_tick = 0
+    mppt_locked = False
+    mppt_va_ref = current_va
+
+
+def mppt_step(current_pout):
+    global ts_lo, ts_hi, ts_state, ts_m1, ts_m2
+    global ts_pwr1, ts_pwr2, ts_cnt, mppt_duty, mppt_tick
+    global mppt_locked
+
+    if mppt_locked:
+        return mppt_duty
+
+    mppt_tick -= 1
+
+    if ts_state == "IDLE":
+        if mppt_tick > 0:
+            return mppt_duty
+
+        if (ts_hi - ts_lo) < MPPT_TOL:
+            mppt_duty = (ts_lo + ts_hi) // 2
+            mppt_locked = True
+            return mppt_duty
+
+        third = (ts_hi - ts_lo) // 3
+        ts_m1 = ts_lo + third
+        ts_m2 = ts_hi - third
+
+        ts_pwr1 = 0.0
+        ts_cnt = 0
+        ts_state = "PROBE_M1"
+        mppt_duty = ts_m1
+        return mppt_duty
+
+    elif ts_state == "PROBE_M1":
+        ts_pwr1 += current_pout
+        ts_cnt += 1
+
+        if ts_cnt >= MPPT_PROBE_AVG:
+            ts_pwr1 /= MPPT_PROBE_AVG
+            ts_pwr2 = 0.0
+            ts_cnt = 0
+            ts_state = "PROBE_M2"
+            mppt_duty = ts_m2
+
+        return mppt_duty
+
+    elif ts_state == "PROBE_M2":
+        ts_pwr2 += current_pout
+        ts_cnt += 1
+
+        if ts_cnt >= MPPT_PROBE_AVG:
+            ts_pwr2 /= MPPT_PROBE_AVG
+            ts_state = "DECIDE"
+
+        return mppt_duty
+
+    elif ts_state == "DECIDE":
+        if ts_pwr1 < ts_pwr2:
+            ts_lo = ts_m1
+        else:
+            ts_hi = ts_m2
+
+        mppt_duty = (ts_lo + ts_hi) // 2
+        mppt_tick = MPPT_INTERVAL
+        ts_state = "IDLE"
+        return mppt_duty
+
+    return mppt_duty
+
+
+while True:
+    handle_web_request()
+
+    if first_run:
+        ina = ina219(SHUNT_OHMS, 64, 5)
+        ina.configure()
+
+        ina2 = ina219_2(SHUNT_OHMS, 0x44, 5)
+        ina2.configure()
+
+        first_run = 0
+        loop_timer = Timer(mode=Timer.PERIODIC, freq=1000, callback=tick)
+
+    if timer_elapsed == 1:
+        va = 1.017 * (12490 / 2490) * 3.3 * (va_pin.read_u16() / 65536)
+        vb = 1.015 * (12490 / 2490) * 3.3 * (vb_pin.read_u16() / 65536)
+
+        vpot_in = 1.026 * 3.3 * (vpot_pin.read_u16() / 65536)
+        v_pot_filt[v_pot_index] = vpot_in
+        v_pot_index += 1
+
+        if v_pot_index == 100:
+            v_pot_index = 0
+
+        vpot = sum(v_pot_filt) / 100
+
+        Vshunt = ina.vshunt()
+
+        Vshunt2 = ina2.vshunt()
+        iL2_raw = Vshunt2 / SHUNT_OHMS
+
+        il2_buf[il2_idx] = iL2_raw
+        il2_idx = (il2_idx + 1) % IL2_FILT_LEN
+
+        iL2 = sum(il2_buf) / IL2_FILT_LEN
+
+        pout = VBUS_NOM * iL2
+
+        CL = OL_CL_pin.value()
+        BU = BU_BO_pin.value()
+
+        duty = 0
+
+        if BU:
+            min_pwm = 0
+            max_pwm = 65500
+            iL = Vshunt / SHUNT_OHMS
+
+            pwm_ref = saturate(
+                65536 - int(((vpot - 0.1) / 3) * 65536),
+                max_pwm,
+                min_pwm,
+            )
+
+            if CL != 1:
+                v_err_int = 0
+
+                if iL > 3:
+                    pwm_out -= 100
+                    OC = 1
+                elif iL < 2.9:
+                    pwm_out += 100
+                    OC = 0
+
+                pwm_out = saturate(pwm_out, pwm_ref, min_pwm)
+                duty = int(65536 - pwm_out)
+                pwm.duty_u16(duty)
+
+            else:
+                if iL > 3:
+                    v_ref -= 0.1
+                    OC = 1
+                elif iL < 2.9:
+                    v_ref += 0.1
+                    OC = 0
+
+                v_ref = saturate(v_ref, vpot * 3, 0)
+                v_err = v_ref - vb
+                v_err_int += v_err
+                v_err_int = saturate(v_err_int, 10000, -10000)
+                v_pi_out = (kp * v_err) + (ki * v_err_int)
+
+                pwm_out = saturate(v_pi_out, max_pwm, min_pwm)
+                duty = int(65536 - pwm_out)
+                pwm.duty_u16(duty)
+
+        else:
+            min_pwm = 0
+            max_pwm = 60000
+            iL = -(Vshunt / SHUNT_OHMS)
+
+            pwm_ref = saturate(
+                int(((vpot - 0.025) / 3) * 65536),
+                max_pwm,
+                min_pwm,
+            )
+
+            if CL != 1:
+                v_err_int = 0
+
+                if iL > 1.6:
+                    pwm_out -= 100
+                    OC = 1
+                elif iL < 1.5:
+                    pwm_out += 100
+                    OC = 0
+
+                pwm_out = saturate(pwm_out, pwm_ref, min_pwm)
+                duty = int(pwm_out)
+                pwm.duty_u16(duty)
+
+            else:
+                if iL > 1.6:
+                    v_ref -= 0.1
+                    OC = 1
+                elif iL < 1.5:
+                    v_ref += 0.1
+                    OC = 0
+
+                if mppt_va_ref is None:
+                    reset_mppt_sweep(va)
+
+                if mppt_restart_cooldown > 0:
+                    mppt_restart_cooldown -= 1
+
+                if abs(va - mppt_va_ref) > VA_RESTART_THRESHOLD:
+                    va_change_count += 1
+                else:
+                    va_change_count = 0
+
+                if (
+                    va_change_count >= VA_RESTART_COUNT_REQUIRED
+                    and mppt_restart_cooldown == 0
+                ):
+                    print("Sustained Va change — restarting MPPT sweep")
+                    reset_mppt_sweep(va)
+                    mppt_restart_cooldown = VA_RESTART_COOLDOWN
+                    va_change_count = 0
+
+                mppt_duty = mppt_step(pout)
+                mppt_duty = saturate(mppt_duty, max_pwm, min_pwm)
+
+                if OC:
+                    v_ref = saturate(v_ref, vb + (vpot * 3), 0)
+                    v_err = v_ref - va
+                    v_err_int += v_err
+                    v_err_int = saturate(v_err_int, 10000, -10000)
+                    v_pi_out = (kp * v_err) + (ki * v_err_int)
+                    duty = int(saturate(v_pi_out, max_pwm, min_pwm))
+                else:
+                    v_err_int = 0
+                    duty = int(mppt_duty)
+
+                pwm.duty_u16(duty)
+
+        count += 1
+        timer_elapsed = 0
+
+        if count >= 100:
+            print("Va       = {:.3f} V".format(va))
+            print("Vb       = {:.3f} V".format(vb))
+            print("Vpot     = {:.3f} V".format(vpot))
+            print("iL       = {:.3f} A".format(iL))
+            print("iL2      = {:.3f} A".format(iL2))
+            print("pout     = {:.3f} W".format(pout))
+            print("duty     = {:d}".format(duty))
+            print("OC       = {:b}".format(OC))
+            print("CL       = {:b}".format(CL))
+            print("BU       = {:b}".format(BU))
+            print("Pout URL = http://" + PICO_IP + "/pout")
+
+            if not BU and CL:
+                print("MPPT_st  = {}".format(ts_state))
+                print("MPPT_lock= {}".format(mppt_locked))
+                print("Va_ref   = {}".format(mppt_va_ref))
+                print("Va_count = {:d}".format(va_change_count))
+                print("bracket  = [{:d}, {:d}]".format(ts_lo, ts_hi))
+
+            count = 0
