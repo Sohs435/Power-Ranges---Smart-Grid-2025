@@ -1,0 +1,220 @@
+from machine import Pin, I2C, ADC, Timer
+
+# ---------------------------------------------------------------------------
+# ADC pins
+# ---------------------------------------------------------------------------
+va_pin = ADC(Pin(28))
+vb_pin = ADC(Pin(26))
+
+# ---------------------------------------------------------------------------
+# I2C for INA219 current sensor
+# ---------------------------------------------------------------------------
+ina_i2c = I2C(0, scl=Pin(1), sda=Pin(0), freq=2400000)
+
+# ---------------------------------------------------------------------------
+# Basic loop timing
+# ---------------------------------------------------------------------------
+timer_elapsed = 0
+count = 0
+first_run = 1
+
+# ---------------------------------------------------------------------------
+# Shunt resistance
+# ---------------------------------------------------------------------------
+SHUNT_OHMS = 0.10
+
+
+# ---------------------------------------------------------------------------
+# Efficiency table from your measured data
+# Ib is side-B current.
+#
+# Ib < 0 means power flow A -> B
+# Ib > 0 means power flow B -> A
+# ---------------------------------------------------------------------------
+IB_TABLE = [
+    -1.490, -1.355, -1.214, -1.079, -0.913, -0.731, -0.597,
+    -0.441, -0.311, -0.197, -0.122, -0.094, -0.054, -0.026,
+     0.028,  0.102,  0.125,  0.139,  0.184,  0.325,  0.466,
+     0.588,  0.701,  0.945,  1.224,  1.410,  1.501
+]
+
+EFF_TABLE = [
+    0.921157, 0.924612, 0.928567, 0.928021, 0.936718, 0.928839,
+    0.925591, 0.914902, 0.903194, 0.882373, 0.839215, 0.784013,
+    0.679766, 0.510195, 0.053536, 0.734877, 0.767565, 0.798109,
+    0.855579, 0.881303, 0.901227, 0.911443, 0.918893, 0.915476,
+    0.909635, 0.905605, 0.901894
+]
+
+
+# ---------------------------------------------------------------------------
+# Linear interpolation between efficiency points
+# ---------------------------------------------------------------------------
+def interp(x, x_table, y_table):
+
+    if x <= x_table[0]:
+        return y_table[0]
+
+    if x >= x_table[-1]:
+        return y_table[-1]
+
+    for i in range(len(x_table) - 1):
+
+        x0 = x_table[i]
+        x1 = x_table[i + 1]
+
+        if x0 <= x <= x1:
+
+            y0 = y_table[i]
+            y1 = y_table[i + 1]
+
+            frac = (x - x0) / (x1 - x0)
+
+            return y0 + frac * (y1 - y0)
+
+    return y_table[-1]
+
+
+# ---------------------------------------------------------------------------
+# Main calculation function
+# ---------------------------------------------------------------------------
+def calculate_power_values(va, vb, ib):
+
+    # Side-B power
+    pb = vb * ib
+
+    # Efficiency from Ib using linear interpolation
+    eff = interp(ib, IB_TABLE, EFF_TABLE)
+
+    # Prevent divide-by-zero or nonsense at very low efficiency near zero current
+    if eff < 0.05:
+        eff = 0.05
+
+    if ib < 0:
+        # Power flow A -> B
+        # B side is output, so A side input power is larger
+        pa = abs(pb) / eff
+        direction = "A_TO_B"
+
+    elif ib > 0:
+        # Power flow B -> A
+        # B side is input, so A side output power is smaller
+        pa = -abs(pb) * eff
+        direction = "B_TO_A"
+
+    else:
+        pa = 0.0
+        direction = "ZERO"
+
+    # Ia approximation from Pa = Va * Ia
+    if va > 0.1:
+        ia = pa / va
+    else:
+        ia = 0.0
+
+    return pb, pa, ia, eff, direction
+
+
+# ---------------------------------------------------------------------------
+# Timer callback
+# ---------------------------------------------------------------------------
+def tick(t):
+    global timer_elapsed
+    timer_elapsed = 1
+
+
+# ---------------------------------------------------------------------------
+# INA219 current sensor driver
+# ---------------------------------------------------------------------------
+class ina219:
+
+    REG_CONFIG = 0x00
+    REG_SHUNTVOLTAGE = 0x01
+    REG_BUSVOLTAGE = 0x02
+    REG_POWER = 0x03
+    REG_CURRENT = 0x04
+    REG_CALIBRATION = 0x05
+
+    def __init__(self, sr, address, maxi):
+        self.address = address
+        self.shunt = sr
+
+    def vshunt(self):
+        reg_bytes = ina_i2c.readfrom_mem(self.address, self.REG_SHUNTVOLTAGE, 2)
+        reg_value = int.from_bytes(reg_bytes, 'big')
+
+        if reg_value > 2**15:
+            sign = -1
+            for i in range(16):
+                reg_value = reg_value ^ (1 << i)
+        else:
+            sign = 1
+
+        return float(reg_value) * 1e-5 * sign
+
+    def vbus(self):
+        reg_bytes = ina_i2c.readfrom_mem(self.address, self.REG_BUSVOLTAGE, 2)
+        reg_value = int.from_bytes(reg_bytes, 'big') >> 3
+        return float(reg_value) * 0.004
+
+    def configure(self):
+        ina_i2c.writeto_mem(self.address, self.REG_CONFIG, b'\x19\x9F')
+        ina_i2c.writeto_mem(self.address, self.REG_CALIBRATION, b'\x00\x00')
+
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+while True:
+
+    if first_run:
+        ina = ina219(SHUNT_OHMS, 64, 5)
+        ina.configure()
+
+        first_run = 0
+
+        loop_timer = Timer(mode=Timer.PERIODIC, freq=1000, callback=tick)
+
+    if timer_elapsed == 1:
+
+        # -------------------------------------------------------------------
+        # Read voltages
+        # -------------------------------------------------------------------
+        va = 1.017 * (12490 / 2490) * 3.3 * (va_pin.read_u16() / 65536)
+        vb = 1.015 * (12490 / 2490) * 3.3 * (vb_pin.read_u16() / 65536)
+
+        # -------------------------------------------------------------------
+        # Read current
+        # -------------------------------------------------------------------
+        Vshunt = ina.vshunt()
+
+        ib = Vshunt / SHUNT_OHMS
+
+        # -------------------------------------------------------------------
+        # Calculate values
+        # -------------------------------------------------------------------
+        pb, pa, ia, eff, direction = calculate_power_values(va, vb, ib)
+
+        count += 1
+        timer_elapsed = 0
+
+        # -------------------------------------------------------------------
+        # Print every 100 loops
+        # -------------------------------------------------------------------
+        if count > 100:
+
+            print("Va        = {:.3f} V".format(va))
+            print("Vb        = {:.3f} V".format(vb))
+
+            print("Ib        = {:.3f} A".format(ib))
+            print("Pb        = {:.3f} W".format(pb))
+
+            print("Eff       = {:.3f}".format(eff))
+
+            print("Pa approx = {:.3f} W".format(pa))
+            print("Ia approx = {:.3f} A".format(ia))
+
+            print("Flow      = {}".format(direction))
+            print("-----------------------------")
+
+            count = 0
