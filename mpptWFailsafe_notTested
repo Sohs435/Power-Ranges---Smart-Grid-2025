@@ -1,0 +1,915 @@
+from machine import Pin, I2C, ADC, PWM, Timer
+import network
+import time
+import socket
+
+# OG MPPT
+
+# -----------------------------------------------------------------------------
+# WiFi setup with reconnecting fallback
+# -----------------------------------------------------------------------------
+
+SSID = "Krishsphone"
+PASSWORD = "waterbottle"
+
+WIFI_CONNECT_TIMEOUT_S = 20
+WIFI_RETRY_INTERVAL_MS = 5000
+WIFI_RECONNECT_TIMEOUT_MS = 3000
+
+wifi_connected = False
+wifi_connecting = False
+wifi_connect_start_ms = 0
+last_wifi_retry_ms = 0
+
+server = None
+PICO_IP = "NO_WIFI"
+
+wlan = network.WLAN(network.STA_IF)
+wlan.active(True)
+
+
+def close_server():
+    global server
+
+    try:
+        if server:
+            server.close()
+    except:
+        pass
+
+    server = None
+
+
+def start_web_server():
+    global server, PICO_IP
+
+    close_server()
+
+    PICO_IP = wlan.ifconfig()[0]
+
+    print("Connected!")
+    print("Pico IP:", PICO_IP)
+    print("Power URL: http://" + PICO_IP + "/pout")
+
+    server = socket.socket()
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("0.0.0.0", 80))
+    server.listen(1)
+    server.setblocking(False)
+
+    print("Web server running")
+    print("Poll this from Flask: http://" + PICO_IP + "/pout")
+
+
+def start_wifi_connect():
+    global wifi_connecting, wifi_connect_start_ms
+
+    print("Connecting...")
+    wlan.connect(SSID, PASSWORD)
+    wifi_connecting = True
+    wifi_connect_start_ms = time.ticks_ms()
+
+
+def update_wifi_connection():
+    global wifi_connected, wifi_connecting
+    global last_wifi_retry_ms, PICO_IP
+    global last_sun, last_tick
+    global sun_tick_valid, sun_tick_stable, sun_good_count
+
+    now_ms = time.ticks_ms()
+
+    # If already connected, keep checking that connection is still alive.
+    if wifi_connected:
+        if wlan.isconnected():
+            return
+
+        print("WiFi connection lost. Returning to MPPT failsafe mode.")
+
+        wifi_connected = False
+        wifi_connecting = False
+        PICO_IP = "NO_WIFI"
+
+        last_sun = None
+        last_tick = None
+        sun_tick_valid = False
+        sun_tick_stable = False
+        sun_good_count = 0
+
+        close_server()
+        last_wifi_retry_ms = now_ms
+        return
+
+    # If not connected and not already trying, retry every 5 seconds.
+    if not wifi_connecting:
+        if time.ticks_diff(now_ms, last_wifi_retry_ms) >= WIFI_RETRY_INTERVAL_MS:
+            last_wifi_retry_ms = now_ms
+            start_wifi_connect()
+
+        return
+
+    # If currently trying to connect, check whether connection succeeded.
+    if wlan.isconnected():
+        wifi_connected = True
+        wifi_connecting = False
+
+        last_sun = None
+        last_tick = None
+        sun_tick_valid = False
+        sun_tick_stable = False
+        sun_good_count = 0
+
+        start_web_server()
+        return
+
+    # If connection attempt takes too long, give up and remain in failsafe mode.
+    if time.ticks_diff(now_ms, wifi_connect_start_ms) >= WIFI_RECONNECT_TIMEOUT_MS:
+        print("WiFi unavailable. Running MPPT failsafe mode.")
+        wifi_connected = False
+        wifi_connecting = False
+        PICO_IP = "NO_WIFI"
+
+        last_sun = None
+        last_tick = None
+        sun_tick_valid = False
+        sun_tick_stable = False
+        sun_good_count = 0
+
+        close_server()
+        last_wifi_retry_ms = now_ms
+
+
+# Initial connection attempt
+print("Connecting...")
+wlan.connect(SSID, PASSWORD)
+
+wifi_start_time = time.time()
+
+while not wlan.isconnected():
+    if time.time() - wifi_start_time > WIFI_CONNECT_TIMEOUT_S:
+        print("WiFi connection failed. Running MPPT failsafe mode.")
+        wifi_connected = False
+        wifi_connecting = False
+        last_wifi_retry_ms = time.ticks_ms()
+        break
+
+    print("Connecting...")
+    time.sleep(1)
+
+if wlan.isconnected():
+    wifi_connected = True
+    wifi_connecting = False
+    start_web_server()
+
+
+# -----------------------------------------------------------------------------
+# Sun polling setup
+# -----------------------------------------------------------------------------
+
+SUN_SERVER_HOST = "172.20.10.4"
+SUN_SERVER_PORT = 8000
+SUN_SERVER_PATH = "/api/sun_data"
+
+SUN_POLL_TICKS = 1000
+sun_poll_counter = 0
+
+last_sun = None
+last_tick = None
+
+sun_tick_valid = False
+sun_tick_stable = False
+sun_good_count = 0
+SUN_STABLE_READS = 3
+
+
+# -----------------------------------------------------------------------------
+# MPPT failsafe setup
+# If WiFi is unavailable or sun ticks are unreadable, rerun MPPT every 5 seconds.
+# The main loop runs from a 1 kHz timer, so 5000 counts = 5 seconds.
+# -----------------------------------------------------------------------------
+
+MPPT_FAILSAFE_TICKS = 5000
+mppt_failsafe_counter = 0
+
+
+# -----------------------------------------------------------------------------
+# Set up some pin allocations for the Analogues and switches
+# -----------------------------------------------------------------------------
+
+va_pin = ADC(Pin(28))
+vb_pin = ADC(Pin(26))
+vpot_pin = ADC(Pin(27))
+
+OL_CL_pin = Pin(12, Pin.IN, Pin.PULL_UP)
+BU_BO_pin = Pin(2, Pin.IN, Pin.PULL_UP)
+
+
+# -----------------------------------------------------------------------------
+# Set up the I2C for the INA219 chips for current sensing
+# -----------------------------------------------------------------------------
+
+ina_i2c = I2C(0, scl=Pin(1), sda=Pin(0), freq=2400000)
+ina_i2c_2 = I2C(1, scl=Pin(19), sda=Pin(18), freq=400000)
+
+
+# -----------------------------------------------------------------------------
+# Some PWM settings
+# -----------------------------------------------------------------------------
+
+pwm = PWM(Pin(9))
+pwm.freq(100000)
+
+min_pwm = 0
+max_pwm = 64536
+pwm_out = min_pwm
+pwm_ref = 30000
+
+
+# -----------------------------------------------------------------------------
+# Some error signals
+# -----------------------------------------------------------------------------
+
+trip = 0
+OC = 0
+
+
+# -----------------------------------------------------------------------------
+# The potentiometer is prone to noise so we are filtering the value
+# using a moving average
+# -----------------------------------------------------------------------------
+
+v_pot_filt = [0] * 100
+v_pot_index = 0
+
+
+# -----------------------------------------------------------------------------
+# Gains etc for the PID controller
+# -----------------------------------------------------------------------------
+
+v_ref = 0
+v_err = 0
+v_err_int = 0
+v_pi_out = 0
+
+kp = 100
+ki = 30
+
+
+# -----------------------------------------------------------------------------
+# Basic signals to control logic flow
+# -----------------------------------------------------------------------------
+
+timer_elapsed = 0
+count = 0
+first_run = 1
+
+
+# -----------------------------------------------------------------------------
+# Need to know the shunt resistance to calculate the current
+# -----------------------------------------------------------------------------
+
+SHUNT_OHMS = 0.10
+
+
+# -----------------------------------------------------------------------------
+# Output current moving average
+# -----------------------------------------------------------------------------
+
+IL2_FILT_LEN = 50
+il2_buf = [0.0] * IL2_FILT_LEN
+il2_idx = 0
+
+
+# -----------------------------------------------------------------------------
+# MPPT ternary sweep settings
+# -----------------------------------------------------------------------------
+
+MPPT_MIN_DUTY = 10000
+MPPT_MAX_DUTY = 60000
+MPPT_TOL = 250
+MPPT_DWELL = 30
+
+mppt_lo = MPPT_MIN_DUTY
+mppt_hi = MPPT_MAX_DUTY
+mppt_m1 = 0
+mppt_m2 = 0
+mppt_p1 = 0.0
+mppt_p2 = 0.0
+mppt_count = 0
+mppt_state = 0
+mppt_duty = MPPT_MIN_DUTY
+mppt_done = False
+mppt_hold_duty = MPPT_MIN_DUTY
+
+
+# -----------------------------------------------------------------------------
+# Live telemetry for webserver
+# -----------------------------------------------------------------------------
+
+va = 0.0
+vb = 0.0
+vpot = 0.0
+iL = 0.0
+iL_abs = 0.0
+iL2 = 0.0
+iL2_abs = 0.0
+pout = 0.0
+duty = 0
+
+
+def saturate(signal, upper, lower):
+    if signal > upper:
+        signal = upper
+
+    if signal < lower:
+        signal = lower
+
+    return signal
+
+
+def tick(t):
+    global timer_elapsed
+
+    timer_elapsed = 1
+
+
+def extract_json_value(body, key):
+    key_text = '"' + key + '"'
+    key_pos = body.find(key_text)
+
+    if key_pos < 0:
+        return None
+
+    colon_pos = body.find(":", key_pos)
+
+    if colon_pos < 0:
+        return None
+
+    value_start = colon_pos + 1
+
+    while value_start < len(body) and body[value_start] == " ":
+        value_start = value_start + 1
+
+    value_end = value_start
+
+    while value_end < len(body):
+        char = body[value_end]
+
+        if char == "," or char == "}":
+            break
+
+        value_end = value_end + 1
+
+    raw_value = body[value_start:value_end].strip()
+
+    if raw_value == "null" or raw_value == "None" or raw_value == "":
+        return None
+
+    try:
+        if "." in raw_value:
+            return float(raw_value)
+
+        return int(raw_value)
+
+    except:
+        return None
+
+
+def poll_sun_data():
+    s = None
+
+    try:
+        addr = socket.getaddrinfo(SUN_SERVER_HOST, SUN_SERVER_PORT)[0][-1]
+
+        s = socket.socket()
+        s.settimeout(1)
+        s.connect(addr)
+
+        request = (
+            "GET " + SUN_SERVER_PATH + " HTTP/1.1\r\n"
+            "Host: " + SUN_SERVER_HOST + "\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        )
+
+        s.send(request.encode())
+
+        response = b""
+
+        while True:
+            chunk = s.recv(128)
+
+            if not chunk:
+                break
+
+            response = response + chunk
+
+            if len(response) > 768:
+                break
+
+        s.close()
+
+        text = response.decode()
+        split_pos = text.find("\r\n\r\n")
+
+        if split_pos >= 0:
+            body = text[split_pos + 4:]
+        else:
+            body = text
+
+        sun_value = extract_json_value(body, "sun")
+        sun_tick = extract_json_value(body, "tick")
+
+        return sun_value, sun_tick
+
+    except:
+        try:
+            if s:
+                s.close()
+        except:
+            pass
+
+        return None, None
+
+
+def check_sun_change():
+    global last_sun, last_tick
+    global sun_tick_valid, sun_tick_stable, sun_good_count
+
+    sun_value, sun_tick = poll_sun_data()
+
+    if sun_tick is None:
+        sun_tick_valid = False
+        sun_tick_stable = False
+        sun_good_count = 0
+        return
+
+    sun_tick_valid = True
+    sun_good_count = sun_good_count + 1
+
+    if sun_good_count >= SUN_STABLE_READS:
+        sun_tick_stable = True
+
+    if last_tick is None:
+        last_tick = sun_tick
+        last_sun = sun_value
+        return
+
+    if sun_tick != last_tick:
+        if sun_value != last_sun:
+            reset_mppt()
+
+        last_tick = sun_tick
+        last_sun = sun_value
+
+
+def handle_web_request():
+    global pout, va, vb, vpot
+    global duty, iL, iL_abs, iL2, iL2_abs
+    global mppt_duty, mppt_lo, mppt_hi, mppt_state
+    global mppt_p1, mppt_p2
+    global server
+
+    if server is None:
+        return
+
+    try:
+        cl, addr = server.accept()
+    except OSError:
+        return
+
+    try:
+        cl.settimeout(1)
+        request = cl.recv(1024).decode()
+
+        if "GET /pout" in request:
+            body = str(pout)
+
+        elif "GET /data" in request:
+            body = (
+                '{{"pout": {}, "va": {}, "vb": {}, "vpot": {}, '
+                '"duty": {}, "iL": {}, "iL_abs": {}, '
+                '"iL2": {}, "iL2_abs": {}, '
+                '"mppt_duty": {}, "mppt_lo": {}, "mppt_hi": {}, '
+                '"mppt_state": {}, "mppt_p1": {}, "mppt_p2": {}}}'
+            ).format(
+                pout,
+                va,
+                vb,
+                vpot,
+                duty,
+                iL,
+                iL_abs,
+                iL2,
+                iL2_abs,
+                mppt_duty,
+                mppt_lo,
+                mppt_hi,
+                mppt_state,
+                mppt_p1,
+                mppt_p2,
+            )
+
+        else:
+            body = "HELLO FROM PICO. Use /pout for power or /data for telemetry."
+
+        response = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/plain\r\n"
+            "Connection: close\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "\r\n"
+            + body
+        )
+
+        cl.sendall(response.encode())
+
+    except Exception as e:
+        print("Web error:", e)
+
+    try:
+        cl.close()
+    except:
+        pass
+
+
+def reset_mppt():
+    global mppt_lo, mppt_hi
+    global mppt_m1, mppt_m2
+    global mppt_p1, mppt_p2
+    global mppt_count, mppt_state
+    global mppt_duty
+    global mppt_done, mppt_hold_duty
+
+    mppt_lo = MPPT_MIN_DUTY
+    mppt_hi = MPPT_MAX_DUTY
+    mppt_m1 = 0
+    mppt_m2 = 0
+    mppt_p1 = 0.0
+    mppt_p2 = 0.0
+    mppt_count = 0
+    mppt_state = 0
+    mppt_duty = MPPT_MIN_DUTY
+    mppt_done = False
+    mppt_hold_duty = MPPT_MIN_DUTY
+
+
+def mppt_ternary_step(pout):
+    global mppt_lo, mppt_hi
+    global mppt_m1, mppt_m2
+    global mppt_p1, mppt_p2
+    global mppt_count, mppt_state
+    global mppt_duty
+    global mppt_done, mppt_hold_duty
+
+    # If bracket is small enough, use midpoint, then hold sweep
+    if mppt_hi - mppt_lo < MPPT_TOL:
+        mppt_duty = int((mppt_lo + mppt_hi) / 2)
+        mppt_hold_duty = mppt_duty
+        mppt_done = True
+
+        return mppt_duty
+
+    # State 0: choose ternary probe points
+    if mppt_state == 0:
+        third = int((mppt_hi - mppt_lo) / 3)
+        mppt_m1 = mppt_lo + third
+        mppt_m2 = mppt_hi - third
+
+        mppt_p1 = 0.0
+        mppt_p2 = 0.0
+        mppt_count = 0
+
+        mppt_duty = mppt_m1
+        mppt_state = 1
+
+        return mppt_duty
+
+    # State 1: dwell at m1 and average power
+    elif mppt_state == 1:
+        mppt_p1 = mppt_p1 + pout
+        mppt_count = mppt_count + 1
+
+        if mppt_count >= MPPT_DWELL:
+            mppt_p1 = mppt_p1 / MPPT_DWELL
+            mppt_count = 0
+            mppt_duty = mppt_m2
+            mppt_state = 2
+
+        return mppt_duty
+
+    # State 2: dwell at m2 and average power
+    elif mppt_state == 2:
+        mppt_p2 = mppt_p2 + pout
+        mppt_count = mppt_count + 1
+
+        if mppt_count >= MPPT_DWELL:
+            mppt_p2 = mppt_p2 / MPPT_DWELL
+
+            # Maximise power
+            if mppt_p1 < mppt_p2:
+                mppt_lo = mppt_m1
+            else:
+                mppt_hi = mppt_m2
+
+            mppt_duty = int((mppt_lo + mppt_hi) / 2)
+            mppt_state = 0
+            mppt_count = 0
+
+        return mppt_duty
+
+    return mppt_duty
+
+
+# -----------------------------------------------------------------------------
+# INA219 on I2C bus 0
+# -----------------------------------------------------------------------------
+
+class ina219:
+    REG_CONFIG = 0x00
+    REG_SHUNTVOLTAGE = 0x01
+    REG_BUSVOLTAGE = 0x02
+    REG_POWER = 0x03
+    REG_CURRENT = 0x04
+    REG_CALIBRATION = 0x05
+
+    def __init__(self, sr, address, maxi):
+        self.address = address
+        self.shunt = sr
+
+    def vshunt(icur):
+        reg_bytes = ina_i2c.readfrom_mem(icur.address, icur.REG_SHUNTVOLTAGE, 2)
+        reg_value = int.from_bytes(reg_bytes, "big")
+
+        if reg_value > 2 ** 15:
+            sign = -1
+            for i in range(16):
+                reg_value = reg_value ^ (1 << i)
+        else:
+            sign = 1
+
+        return float(reg_value) * 1e-5 * sign
+
+    def vbus(ivolt):
+        reg_bytes = ina_i2c.readfrom_mem(ivolt.address, ivolt.REG_BUSVOLTAGE, 2)
+        reg_value = int.from_bytes(reg_bytes, "big") >> 3
+
+        return float(reg_value) * 0.004
+
+    def configure(conf):
+        ina_i2c.writeto_mem(conf.address, conf.REG_CONFIG, b"\x19\x9F")
+        ina_i2c.writeto_mem(conf.address, conf.REG_CALIBRATION, b"\x00\x00")
+
+
+# -----------------------------------------------------------------------------
+# INA219 on I2C bus 1
+# -----------------------------------------------------------------------------
+
+class ina219_2:
+    REG_CONFIG = 0x00
+    REG_SHUNTVOLTAGE = 0x01
+    REG_BUSVOLTAGE = 0x02
+    REG_POWER = 0x03
+    REG_CURRENT = 0x04
+    REG_CALIBRATION = 0x05
+
+    def __init__(self, sr, address, maxi):
+        self.address = address
+        self.shunt = sr
+
+    def vshunt(icur):
+        reg_bytes = ina_i2c_2.readfrom_mem(icur.address, icur.REG_SHUNTVOLTAGE, 2)
+        reg_value = int.from_bytes(reg_bytes, "big")
+
+        if reg_value > 2 ** 15:
+            sign = -1
+            for i in range(16):
+                reg_value = reg_value ^ (1 << i)
+        else:
+            sign = 1
+
+        return float(reg_value) * 1e-5 * sign
+
+    def vbus(ivolt):
+        reg_bytes = ina_i2c_2.readfrom_mem(ivolt.address, ivolt.REG_BUSVOLTAGE, 2)
+        reg_value = int.from_bytes(reg_bytes, "big") >> 3
+
+        return float(reg_value) * 0.004
+
+    def configure(conf):
+        ina_i2c_2.writeto_mem(conf.address, conf.REG_CONFIG, b"\x19\x9F")
+        ina_i2c_2.writeto_mem(conf.address, conf.REG_CALIBRATION, b"\x00\x00")
+
+
+while True:
+    # Keep WiFi state updated.
+    # If disconnected, this will retry connection while MPPT failsafe keeps running.
+    update_wifi_connection()
+
+    # Webserver polling only runs when server exists.
+    handle_web_request()
+
+    if first_run:
+        ina = ina219(SHUNT_OHMS, 64, 5)
+        ina.configure()
+
+        ina2 = ina219_2(SHUNT_OHMS, 0x44, 5)
+        ina2.configure()
+
+        first_run = 0
+
+        loop_timer = Timer(mode=Timer.PERIODIC, freq=1000, callback=tick)
+
+    if timer_elapsed == 1:
+        va = 1.017 * (12490 / 2490) * 3.3 * (va_pin.read_u16() / 65536)
+        vb = 1.015 * (12490 / 2490) * 3.3 * (vb_pin.read_u16() / 65536)
+
+        vpot_in = 1.026 * 3.3 * (vpot_pin.read_u16() / 65536)
+        v_pot_filt[v_pot_index] = vpot_in
+        v_pot_index = v_pot_index + 1
+
+        if v_pot_index == 100:
+            v_pot_index = 0
+
+        vpot = sum(v_pot_filt) / 100
+
+        Vshunt = ina.vshunt()
+
+        # Second current measurement
+        Vshunt2 = ina2.vshunt()
+        iL2_raw = Vshunt2 / SHUNT_OHMS
+
+        il2_buf[il2_idx] = iL2_raw
+        il2_idx = (il2_idx + 1) % IL2_FILT_LEN
+        iL2 = sum(il2_buf) / IL2_FILT_LEN
+        iL2_abs = abs(iL2)
+
+        # In boost mode, Va is the output/load side.
+        # Use abs(iL2), so shunt polarity does not make MPPT chase negative power.
+        pout = va * iL2_abs
+
+        sun_poll_counter = sun_poll_counter + 1
+        mppt_failsafe_counter = mppt_failsafe_counter + 1
+
+        if wifi_connected:
+            # Try to read sun tick once per second.
+            # Until ticks are stable, the MPPT failsafe remains active.
+            if sun_poll_counter >= SUN_POLL_TICKS:
+                sun_poll_counter = 0
+                check_sun_change()
+
+        if not wifi_connected or not sun_tick_stable:
+            # Failsafe mode:
+            # No WiFi OR unreadable/unstable ticks means force MPPT to rerun every 5 seconds.
+            if mppt_failsafe_counter >= MPPT_FAILSAFE_TICKS:
+                mppt_failsafe_counter = 0
+                reset_mppt()
+        else:
+            # Normal mode:
+            # WiFi is connected and sun ticks have been readable for several checks.
+            # MPPT reset is now handled only by check_sun_change().
+            mppt_failsafe_counter = 0
+
+        CL = OL_CL_pin.value()
+        BU = BU_BO_pin.value()
+
+        if BU:
+            # Buck mode
+            min_pwm = 0
+            max_pwm = 65500
+            iL = Vshunt / SHUNT_OHMS
+            iL_abs = abs(iL)
+
+            pwm_ref = saturate(
+                65536 - int(((vpot - 0.1) / 3) * 65536),
+                max_pwm,
+                min_pwm,
+            )
+
+            if CL != 1:
+                # Buck open-loop
+                reset_mppt()
+                v_err_int = 0
+
+                if iL > 3:
+                    pwm_out = pwm_out - 100
+                    OC = 1
+                elif iL < 2.9:
+                    pwm_out = pwm_out + 100
+                    OC = 0
+
+                pwm_out = saturate(pwm_out, pwm_ref, min_pwm)
+                duty = int(65536 - pwm_out)
+                pwm.duty_u16(duty)
+
+            else:
+                # Buck closed-loop
+                reset_mppt()
+
+                if iL > 3:
+                    v_ref = v_ref - 0.1
+                    OC = 1
+                elif iL < 2.9:
+                    v_ref = v_ref + 0.1
+                    OC = 0
+
+                v_ref = saturate(v_ref, vpot * 3, 0)
+                v_err = v_ref - vb
+                v_err_int = v_err_int + v_err
+                v_err_int = saturate(v_err_int, 10000, -10000)
+                v_pi_out = (kp * v_err) + (ki * v_err_int)
+
+                pwm_out = saturate(v_pi_out, max_pwm, min_pwm)
+                duty = int(65536 - pwm_out)
+                pwm.duty_u16(duty)
+
+        else:
+            # Boost mode
+            min_pwm = 0
+            max_pwm = 60000
+            iL = -(Vshunt / SHUNT_OHMS)
+            iL_abs = abs(iL)
+
+            pwm_ref = saturate(
+                int(((vpot - 0.025) / 3) * 65536),
+                max_pwm,
+                min_pwm,
+            )
+
+            if CL != 1:
+                # Boost open-loop
+                reset_mppt()
+                v_err_int = 0
+
+                if iL > 1.6:
+                    pwm_out = pwm_out - 100
+                    OC = 1
+                elif iL < 1.5:
+                    pwm_out = pwm_out + 100
+                    OC = 0
+
+                pwm_out = saturate(pwm_out, pwm_ref, min_pwm)
+                duty = int(pwm_out)
+                pwm.duty_u16(duty)
+
+            else:
+                # Boost closed-loop with MPPT active
+                if iL > 1.6:
+                    OC = 1
+                elif iL < 1.5:
+                    OC = 0
+
+                if OC:
+                    # Current limit overrides MPPT by reducing duty
+                    pwm_out = pwm_out - 100
+                    pwm_out = saturate(pwm_out, max_pwm, min_pwm)
+                    duty = int(pwm_out)
+
+                else:
+                    # MPPT directly controls boost duty
+                    if mppt_done:
+                        mppt_duty = mppt_hold_duty
+                    else:
+                        mppt_duty = mppt_ternary_step(pout)
+
+                    pwm_out = saturate(mppt_duty, MPPT_MAX_DUTY, MPPT_MIN_DUTY)
+                    duty = int(pwm_out)
+
+                pwm.duty_u16(duty)
+
+        count = count + 1
+        timer_elapsed = 0
+
+        if count > 100:
+            print("Va = {:.3f}".format(va))
+            print("Vb = {:.3f}".format(vb))
+            print("Vpot = {:.3f}".format(vpot))
+            print("iL = {:.3f}".format(iL))
+            print("|iL| = {:.3f}".format(iL_abs))
+            print("iL2 = {:.3f}".format(iL2))
+            print("|iL2| = {:.3f}".format(iL2_abs))
+            print("pout = {:.3f}".format(pout))
+            print("OC = {:b}".format(OC))
+            print("CL = {:b}".format(CL))
+            print("BU = {:b}".format(BU))
+            print("duty = {:d}".format(duty))
+
+            if wifi_connected:
+                print("Pout URL = http://" + PICO_IP + "/pout")
+                print("Data URL = http://" + PICO_IP + "/data")
+            else:
+                print("WiFi = DISCONNECTED")
+                print("MPPT failsafe = rerun every 5 seconds")
+
+            print("Sun = {}".format(last_sun))
+            print("Sun tick = {}".format(last_tick))
+            print("Sun tick valid = {}".format(sun_tick_valid))
+            print("Sun tick stable = {}".format(sun_tick_stable))
+
+            if not BU and CL:
+                print("MPPT duty = {:d}".format(mppt_duty))
+                print("MPPT range = [{:d}, {:d}]".format(mppt_lo, mppt_hi))
+                print("MPPT state = {:d}".format(mppt_state))
+                print("MPPT P1 = {:.3f}".format(mppt_p1))
+                print("MPPT P2 = {:.3f}".format(mppt_p2))
+
+            count = 0
