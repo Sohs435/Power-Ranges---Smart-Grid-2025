@@ -1,0 +1,610 @@
+from machine import Pin, I2C, ADC, PWM, Timer
+import network
+import time
+import socket
+
+# -----------------------------------------------------------------------------
+# WiFi setup
+# -----------------------------------------------------------------------------
+
+SSID = "Krishsphone"
+PASSWORD = "waterbottle"
+
+wlan = network.WLAN(network.STA_IF)
+wlan.active(True)
+
+while not wlan.isconnected():
+    print("Connecting...")
+    wlan.connect(SSID, PASSWORD)
+    time.sleep(5)
+
+PICO_IP = wlan.ifconfig()[0]
+
+print("Connected!")
+print("Pico IP:", PICO_IP)
+print("Capacitor Power URL: http://" + PICO_IP + "/pout")
+print("Capacitor Data URL: http://" + PICO_IP + "/data")
+
+server = socket.socket()
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(("0.0.0.0", 80))
+server.listen(1)
+server.setblocking(False)
+
+print("Web server running")
+print("Poll this from Flask: http://" + PICO_IP + "/pout")
+
+
+# -----------------------------------------------------------------------------
+# Set up some pin allocations for the Analogues and switches
+# -----------------------------------------------------------------------------
+
+va_pin = ADC(Pin(28))
+vb_pin = ADC(Pin(26))
+vpot_pin = ADC(Pin(27))
+
+OL_CL_pin = Pin(12, Pin.IN, Pin.PULL_UP)
+BU_BO_pin = Pin(2, Pin.IN, Pin.PULL_UP)
+
+
+# -----------------------------------------------------------------------------
+# Set up the I2C for the INA219 chips for current sensing
+#
+# ina_i2c:
+#   Existing INA219 on GP0/GP1.
+#   Used for the original current-loop measurement.
+#
+# ina_i2c_2:
+#   New INA219 on GP18/GP19.
+#   Used for capacitor/A-port current measurement.
+# -----------------------------------------------------------------------------
+
+ina_i2c = I2C(0, scl=Pin(1), sda=Pin(0), freq=2400000)
+ina_i2c_2 = I2C(1, scl=Pin(19), sda=Pin(18), freq=400000)
+
+
+# -----------------------------------------------------------------------------
+# Some PWM settings
+# -----------------------------------------------------------------------------
+
+pwm = PWM(Pin(9))
+pwm.freq(100000)
+
+min_pwm = 1000
+max_pwm = 64536
+pwm_out = min_pwm
+pwm_ref = 30000
+
+
+# -----------------------------------------------------------------------------
+# Manual placeholder B-side output power command
+#
+# This is the value you manually change for now.
+#
+# Output power is measured on the B side:
+#     pout = Vb * iL
+#
+# Assumed sign convention:
+#     positive pout_ref = capacitor discharges into the B-side bus
+#     negative pout_ref = B-side bus charges the capacitor
+# -----------------------------------------------------------------------------
+
+pout_ref = 1.0  # W
+
+
+# -----------------------------------------------------------------------------
+# Power/current safety limits
+# -----------------------------------------------------------------------------
+
+MAX_POUT_REF = 3.0
+MAX_I_REF = 0.32
+
+
+# -----------------------------------------------------------------------------
+# Capacitor voltage operating limits
+#
+# Capacitor is connected at port A, so Va is treated as capacitor voltage.
+# -----------------------------------------------------------------------------
+
+CAP_V_MIN = 10.0
+CAP_V_MAX = 17.5
+
+
+# -----------------------------------------------------------------------------
+# Automatic pre-charge command
+#
+# Negative value means the B-side bus charges the capacitor.
+# -----------------------------------------------------------------------------
+
+PRECHARGE_POUT = -1.0  # W
+
+
+# -----------------------------------------------------------------------------
+# Some error signals
+# -----------------------------------------------------------------------------
+
+trip = 0
+OC = 0
+
+
+# -----------------------------------------------------------------------------
+# The potentiometer is prone to noise so we are filtering the value
+# using a moving average
+# -----------------------------------------------------------------------------
+
+v_pot_filt = [0] * 100
+v_pot_index = 0
+
+
+# -----------------------------------------------------------------------------
+# Gains etc for the current PI controller
+# -----------------------------------------------------------------------------
+
+i_ref = 0
+i_err = 0
+i_err_int = 0
+i_pi_out = 0
+
+p = 0
+p_ref = 0
+p_err = 0
+p_err_int = 0
+p_pi_out = 0
+
+kp = 100
+ki = 300
+
+
+# -----------------------------------------------------------------------------
+# Basic signals to control logic flow
+# -----------------------------------------------------------------------------
+
+timer_elapsed = 0
+count = 0
+first_run = 1
+
+
+# -----------------------------------------------------------------------------
+# Need to know the shunt resistance to calculate current
+# -----------------------------------------------------------------------------
+
+SHUNT_OHMS = 0.10
+
+
+# -----------------------------------------------------------------------------
+# Capacitor/A-port current moving average
+#
+# This follows the same structure as the PV code, where the second INA reading
+# is filtered before power is calculated.
+# -----------------------------------------------------------------------------
+
+IA_FILT_LEN = 50
+ia_buf = [0.0] * IA_FILT_LEN
+ia_idx = 0
+
+
+# -----------------------------------------------------------------------------
+# Live measurement variables
+# -----------------------------------------------------------------------------
+
+va = 0.0
+vb = 0.0
+vpot = 0.0
+
+iL = 0.0
+iL_abs = 0.0
+
+iA_raw = 0.0
+iA = 0.0
+iA_abs = 0.0
+
+pout_meas_B = 0.0
+
+# This is the capacitor/A-port power value exposed on /pout
+pA_cap = 0.0
+pA_cap_abs = 0.0
+
+duty = 0
+cap_mode = "STARTUP"
+safe_pout_ref = 0.0
+
+
+def saturate(signal, upper, lower):
+    if signal > upper:
+        signal = upper
+
+    if signal < lower:
+        signal = lower
+
+    return signal
+
+
+def tick(t):
+    global timer_elapsed
+
+    timer_elapsed = 1
+
+
+def handle_web_request():
+    global pA_cap, pA_cap_abs
+    global va, vb, vpot
+    global duty
+    global iL, iL_abs
+    global iA_raw, iA, iA_abs
+    global pout_meas_B
+    global pout_ref, safe_pout_ref, cap_mode
+    global CL, BU
+
+    try:
+        cl, addr = server.accept()
+    except OSError:
+        return
+
+    try:
+        cl.settimeout(1)
+        request = cl.recv(1024).decode()
+
+        if "GET /pout" in request:
+            body = str(pA_cap)
+
+        elif "GET /pcap" in request:
+            body = str(pA_cap)
+
+        elif "GET /icap" in request:
+            body = str(iA)
+
+        elif "GET /data" in request:
+            body = (
+                '{{"pA_cap": {}, "pA_cap_abs": {}, '
+                '"iA": {}, "iA_abs": {}, "iA_raw": {}, '
+                '"va": {}, "vb": {}, "vpot": {}, '
+                '"pout_meas_B": {}, "iL": {}, "iL_abs": {}, '
+                '"duty": {}, "pout_ref": {}, "safe_pout_ref": {}, '
+                '"cap_mode": "{}", "CL": {}, "BU": {}}}'
+            ).format(
+                pA_cap,
+                pA_cap_abs,
+                iA,
+                iA_abs,
+                iA_raw,
+                va,
+                vb,
+                vpot,
+                pout_meas_B,
+                iL,
+                iL_abs,
+                duty,
+                pout_ref,
+                safe_pout_ref,
+                cap_mode,
+                CL,
+                BU,
+            )
+
+        else:
+            body = (
+                "HELLO FROM CAPACITOR PICO. "
+                "Use /pout for capacitor A-port power, "
+                "/icap for capacitor current, or /data for telemetry."
+            )
+
+        response = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/plain\r\n"
+            "Connection: close\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "\r\n"
+            + body
+        )
+
+        cl.sendall(response.encode())
+
+    except Exception as e:
+        print("Web error:", e)
+
+    try:
+        cl.close()
+    except:
+        pass
+
+
+# -----------------------------------------------------------------------------
+# INA219 on I2C bus 0
+#
+# This matches the style of your PV code.
+# -----------------------------------------------------------------------------
+
+class ina219:
+    REG_CONFIG = 0x00
+    REG_SHUNTVOLTAGE = 0x01
+    REG_BUSVOLTAGE = 0x02
+    REG_POWER = 0x03
+    REG_CURRENT = 0x04
+    REG_CALIBRATION = 0x05
+
+    def __init__(self, sr, address, maxi):
+        self.address = address
+        self.shunt = sr
+
+    def vshunt(icur):
+        reg_bytes = ina_i2c.readfrom_mem(icur.address, icur.REG_SHUNTVOLTAGE, 2)
+        reg_value = int.from_bytes(reg_bytes, "big")
+
+        if reg_value > 2 ** 15:
+            sign = -1
+            for i in range(16):
+                reg_value = reg_value ^ (1 << i)
+        else:
+            sign = 1
+
+        return float(reg_value) * 1e-5 * sign
+
+    def vbus(ivolt):
+        reg_bytes = ina_i2c.readfrom_mem(ivolt.address, ivolt.REG_BUSVOLTAGE, 2)
+        reg_value = int.from_bytes(reg_bytes, "big") >> 3
+
+        return float(reg_value) * 0.004
+
+    def configure(conf):
+        ina_i2c.writeto_mem(conf.address, conf.REG_CONFIG, b"\x19\x9F")
+        ina_i2c.writeto_mem(conf.address, conf.REG_CALIBRATION, b"\x00\x00")
+
+
+# -----------------------------------------------------------------------------
+# INA219 on I2C bus 1
+#
+# This is the capacitor/A-port INA219.
+# Connected on:
+#     SDA = GP18
+#     SCL = GP19
+#
+# Address is 0x44 to match your PV setup.
+# -----------------------------------------------------------------------------
+
+class ina219_2:
+    REG_CONFIG = 0x00
+    REG_SHUNTVOLTAGE = 0x01
+    REG_BUSVOLTAGE = 0x02
+    REG_POWER = 0x03
+    REG_CURRENT = 0x04
+    REG_CALIBRATION = 0x05
+
+    def __init__(self, sr, address, maxi):
+        self.address = address
+        self.shunt = sr
+
+    def vshunt(icur):
+        reg_bytes = ina_i2c_2.readfrom_mem(icur.address, icur.REG_SHUNTVOLTAGE, 2)
+        reg_value = int.from_bytes(reg_bytes, "big")
+
+        if reg_value > 2 ** 15:
+            sign = -1
+            for i in range(16):
+                reg_value = reg_value ^ (1 << i)
+        else:
+            sign = 1
+
+        return float(reg_value) * 1e-5 * sign
+
+    def vbus(ivolt):
+        reg_bytes = ina_i2c_2.readfrom_mem(ivolt.address, ivolt.REG_BUSVOLTAGE, 2)
+        reg_value = int.from_bytes(reg_bytes, "big") >> 3
+
+        return float(reg_value) * 0.004
+
+    def configure(conf):
+        ina_i2c_2.writeto_mem(conf.address, conf.REG_CONFIG, b"\x19\x9F")
+        ina_i2c_2.writeto_mem(conf.address, conf.REG_CALIBRATION, b"\x00\x00")
+
+
+while True:
+    # Webserver polling/request handling
+    handle_web_request()
+
+    if first_run:
+        # Existing INA219 on GP0/GP1
+        ina = ina219(SHUNT_OHMS, 64, 5)
+        ina.configure()
+
+        # Capacitor/A-port INA219 on GP18/GP19
+        ina2 = ina219_2(SHUNT_OHMS, 0x44, 5)
+        ina2.configure()
+
+        first_run = 0
+
+        loop_timer = Timer(mode=Timer.PERIODIC, freq=1000, callback=tick)
+
+    if timer_elapsed == 1:
+        va = 1.017 * (12490 / 2490) * 3.3 * (va_pin.read_u16() / 65536)
+        vb = 1.015 * (12490 / 2490) * 3.3 * (vb_pin.read_u16() / 65536)
+
+        vpot_in = 1.026 * 3.3 * (vpot_pin.read_u16() / 65536)
+        v_pot_filt[v_pot_index] = vpot_in
+        v_pot_index = v_pot_index + 1
+
+        if v_pot_index == 100:
+            v_pot_index = 0
+
+        vpot = sum(v_pot_filt) / 100
+
+        # ---------------------------------------------------------------------
+        # Existing INA219 current reading
+        #
+        # This is the original current-loop current.
+        # ---------------------------------------------------------------------
+
+        Vshunt = ina.vshunt()
+        iL = Vshunt / SHUNT_OHMS
+        iL_abs = abs(iL)
+
+        # ---------------------------------------------------------------------
+        # Capacitor/A-port INA219 current reading
+        #
+        # This follows the PV code structure:
+        #     read second INA
+        #     calculate current
+        #     filter current
+        #     calculate power
+        #
+        # Since the capacitor is on port A:
+        #     pA_cap = Va * iA
+        # ---------------------------------------------------------------------
+
+        Vshunt2 = ina2.vshunt()
+        iA_raw = Vshunt2 / SHUNT_OHMS
+
+        ia_buf[ia_idx] = iA_raw
+        ia_idx = (ia_idx + 1) % IA_FILT_LEN
+
+        iA = sum(ia_buf) / IA_FILT_LEN
+        iA_abs = abs(iA)
+
+        pA_cap = va * iA
+        pA_cap_abs = va * iA_abs
+
+        CL = OL_CL_pin.value()
+        BU = BU_BO_pin.value()
+
+        # PWM limits based on capacitor maximum voltage
+        min_pwm = 65536 * vb / CAP_V_MAX
+        max_pwm = 64536
+
+        pwm_ref = saturate(
+            65536 - int((vpot / 3.3) * 65536),
+            max_pwm,
+            min_pwm,
+        )
+
+        # B-side output power measurement
+        pout_meas_B = vb * iL
+
+        if CL != 1:
+            # -----------------------------------------------------------------
+            # Open-loop/power mode voltage protection
+            #
+            # This keeps the original potentiometer-based power reference, but
+            # prevents unsafe capacitor operation.
+            # -----------------------------------------------------------------
+
+            p_ref = saturate((vpot - 1.66) * 2, MAX_POUT_REF, -MAX_POUT_REF)
+
+            if va <= CAP_V_MIN and p_ref > 0:
+                p_ref = 0
+
+            if va >= CAP_V_MAX and p_ref < 0:
+                p_ref = 0
+
+            p_err = pout_meas_B - p_ref
+            p_err_int = p_err_int + p_err
+            p_err_int = saturate(p_err_int, max_pwm / 300, min_pwm / 300)
+            p_pi_out = (100 * p_err) + (300 * p_err_int)
+
+            pwm_out = saturate(p_pi_out, max_pwm, min_pwm)
+            duty = int(65536 - pwm_out)
+            pwm.duty_u16(duty)
+
+            safe_pout_ref = p_ref
+            cap_mode = "OPEN_LOOP"
+
+        else:
+            # -----------------------------------------------------------------
+            # Automatic capacitor pre-charge
+            #
+            # If Va is below 10 V, the capacitor is not yet in the useful range.
+            # Therefore, force a small charging command.
+            # -----------------------------------------------------------------
+
+            if va < CAP_V_MIN:
+                safe_pout_ref = PRECHARGE_POUT
+                cap_mode = "PRECHARGE"
+
+            else:
+                safe_pout_ref = saturate(pout_ref, MAX_POUT_REF, -MAX_POUT_REF)
+                cap_mode = "NORMAL"
+
+            # -----------------------------------------------------------------
+            # Capacitor voltage guard
+            #
+            # If Va <= 10 V:
+            #     block discharge
+            #
+            # If Va >= 17.5 V:
+            #     block charge
+            # -----------------------------------------------------------------
+
+            if va <= CAP_V_MIN and safe_pout_ref > 0:
+                safe_pout_ref = 0
+                cap_mode = "LOW_V_BLOCK_DISCHARGE"
+
+            if va >= CAP_V_MAX and safe_pout_ref < 0:
+                safe_pout_ref = 0
+                cap_mode = "HIGH_V_BLOCK_CHARGE"
+
+            # -----------------------------------------------------------------
+            # Convert B-side power command into current reference
+            #
+            # Output power is on port B:
+            #     pout = Vb * iL
+            #
+            # Therefore:
+            #     i_ref = pout_ref / Vb
+            # -----------------------------------------------------------------
+
+            if vb > 1.0:
+                i_ref = saturate(safe_pout_ref / vb, MAX_I_REF, -MAX_I_REF)
+            else:
+                i_ref = 0
+
+            # -----------------------------------------------------------------
+            # Existing current PI controller
+            # -----------------------------------------------------------------
+
+            i_err = i_ref - iL
+            i_err_int = i_err_int + i_err
+            i_err_int = saturate(i_err_int, max_pwm / 300, min_pwm / 300)
+            i_pi_out = (kp * i_err) + (ki * i_err_int)
+
+            pwm_out = saturate(i_pi_out, max_pwm, min_pwm)
+            duty = int(65536 - pwm_out)
+            pwm.duty_u16(duty)
+
+        count = count + 1
+        timer_elapsed = 0
+
+        if count > 100:
+            print("Va = {:.3f}".format(va))
+            print("Vb = {:.3f}".format(vb))
+            print("Vpot = {:.3f}".format(vpot))
+
+            print("iL = {:.3f}".format(iL))
+            print("|iL| = {:.3f}".format(iL_abs))
+            print("pout_meas_B = {:.3f}".format(pout_meas_B))
+
+            print("iA_raw = {:.3f}".format(iA_raw))
+            print("iA = {:.3f}".format(iA))
+            print("|iA| = {:.3f}".format(iA_abs))
+            print("pA_cap = {:.3f}".format(pA_cap))
+            print("|pA_cap| = {:.3f}".format(pA_cap_abs))
+
+            print("OC = {:b}".format(OC))
+            print("CL = {:b}".format(CL))
+            print("BU = {:b}".format(BU))
+            print("duty = {:d}".format(duty))
+
+            print("i_ref = {:.3f}".format(i_ref))
+            print("i_err = {:.3f}".format(i_err))
+            print("i_err_int = {:.3f}".format(i_err_int))
+            print("i_pi_out = {:.3f}".format(i_pi_out))
+
+            print("pout_ref = {:.3f}".format(pout_ref))
+            print("safe_pout_ref = {:.3f}".format(safe_pout_ref))
+            print("cap_mode = {}".format(cap_mode))
+
+            print("pwm_out = {:.3f}".format(pwm_out))
+            print("min_pwm = {:.3f}".format(min_pwm))
+
+            print("Capacitor Power URL = http://" + PICO_IP + "/pout")
+            print("Capacitor Current URL = http://" + PICO_IP + "/icap")
+            print("Capacitor Data URL = http://" + PICO_IP + "/data")
+
+            count = 0
