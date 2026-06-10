@@ -1,0 +1,343 @@
+from machine import Pin, I2C, ADC, PWM, Timer
+import time
+import random
+
+# -----------------------------------------------------------------------------
+# Analogue pins and mode switches
+# -----------------------------------------------------------------------------
+
+va_pin = ADC(Pin(28))
+vb_pin = ADC(Pin(26))
+vpot_pin = ADC(Pin(27))
+
+OL_CL_pin = Pin(12, Pin.IN, Pin.PULL_UP)
+BU_BO_pin = Pin(2, Pin.IN, Pin.PULL_UP)
+
+
+# -----------------------------------------------------------------------------
+# Existing INA219 on I2C bus 0 only
+#
+# SDA = GP0
+# SCL = GP1
+# -----------------------------------------------------------------------------
+
+ina_i2c = I2C(0, scl=Pin(1), sda=Pin(0), freq=2400000)
+
+
+# -----------------------------------------------------------------------------
+# PWM setup
+# -----------------------------------------------------------------------------
+
+pwm = PWM(Pin(9))
+pwm.freq(100000)
+
+min_pwm = 1000
+max_pwm = 64536
+pwm_out = min_pwm
+pwm_ref = 30000
+
+
+# -----------------------------------------------------------------------------
+# Random B-side output power command
+#
+# Every 5 seconds, pout_ref randomly changes between -3 W and +3 W.
+#
+# positive pout_ref = capacitor discharges into the B-side bus
+# negative pout_ref = B-side bus charges the capacitor
+# -----------------------------------------------------------------------------
+
+pout_ref = 0.0
+
+RANDOM_POUT_MIN = -3.0
+RANDOM_POUT_MAX = 3.0
+RANDOM_POUT_INTERVAL_MS = 5000
+last_random_pout_ms = time.ticks_ms()
+
+
+# -----------------------------------------------------------------------------
+# Power/current safety limits
+# -----------------------------------------------------------------------------
+
+MAX_POUT_REF = 3.0
+MAX_I_REF = 0.32
+
+
+# -----------------------------------------------------------------------------
+# Capacitor voltage operating limits
+#
+# Capacitor is connected at port A, so Va is treated as capacitor voltage.
+# -----------------------------------------------------------------------------
+
+CAP_V_MIN = 10.0
+CAP_V_MAX = 16.5
+
+
+# -----------------------------------------------------------------------------
+# Automatic pre-charge command
+#
+# Negative value means the B-side bus charges the capacitor.
+# -----------------------------------------------------------------------------
+
+PRECHARGE_POUT = -1.0
+
+
+# -----------------------------------------------------------------------------
+# Error/status signals
+# -----------------------------------------------------------------------------
+
+trip = 0
+OC = 0
+
+
+# -----------------------------------------------------------------------------
+# Potentiometer moving average filter
+# -----------------------------------------------------------------------------
+
+v_pot_filt = [0] * 100
+v_pot_index = 0
+
+
+# -----------------------------------------------------------------------------
+# PI controller variables
+# -----------------------------------------------------------------------------
+
+i_ref = 0
+i_err = 0
+i_err_int = 0
+i_pi_out = 0
+
+p = 0
+p_ref = 0
+p_err = 0
+p_err_int = 0
+p_pi_out = 0
+
+kp = 100
+ki = 300
+
+
+# -----------------------------------------------------------------------------
+# Loop timing
+# -----------------------------------------------------------------------------
+
+timer_elapsed = 0
+count = 0
+first_run = 1
+
+
+# -----------------------------------------------------------------------------
+# INA219 shunt resistance
+# -----------------------------------------------------------------------------
+
+SHUNT_OHMS = 0.10
+
+
+# -----------------------------------------------------------------------------
+# Live measurement variables
+# -----------------------------------------------------------------------------
+
+va = 0.0
+vb = 0.0
+vpot = 0.0
+
+iL = 0.0
+iL_abs = 0.0
+
+pout_meas_B = 0.0
+
+duty = 0
+cap_mode = "STARTUP"
+safe_pout_ref = 0.0
+
+
+def saturate(signal, upper, lower):
+    if signal > upper:
+        signal = upper
+
+    if signal < lower:
+        signal = lower
+
+    return signal
+
+
+def tick(t):
+    global timer_elapsed
+
+    timer_elapsed = 1
+
+
+class ina219:
+    REG_CONFIG = 0x00
+    REG_SHUNTVOLTAGE = 0x01
+    REG_BUSVOLTAGE = 0x02
+    REG_POWER = 0x03
+    REG_CURRENT = 0x04
+    REG_CALIBRATION = 0x05
+
+    def __init__(self, sr, address, maxi):
+        self.address = address
+        self.shunt = sr
+
+    def vshunt(icur):
+        reg_bytes = ina_i2c.readfrom_mem(icur.address, icur.REG_SHUNTVOLTAGE, 2)
+        reg_value = int.from_bytes(reg_bytes, "big")
+
+        if reg_value > 2 ** 15:
+            sign = -1
+            for i in range(16):
+                reg_value = reg_value ^ (1 << i)
+        else:
+            sign = 1
+
+        return float(reg_value) * 1e-5 * sign
+
+    def vbus(ivolt):
+        reg_bytes = ina_i2c.readfrom_mem(ivolt.address, ivolt.REG_BUSVOLTAGE, 2)
+        reg_value = int.from_bytes(reg_bytes, "big") >> 3
+
+        return float(reg_value) * 0.004
+
+    def configure(conf):
+        ina_i2c.writeto_mem(conf.address, conf.REG_CONFIG, b"\x19\x9F")
+        ina_i2c.writeto_mem(conf.address, conf.REG_CALIBRATION, b"\x00\x00")
+
+
+while True:
+    if first_run:
+        ina = ina219(SHUNT_OHMS, 64, 5)
+        ina.configure()
+
+        first_run = 0
+
+        loop_timer = Timer(mode=Timer.PERIODIC, freq=1000, callback=tick)
+
+    if timer_elapsed == 1:
+        va = 1.017 * (12490 / 2490) * 3.3 * (va_pin.read_u16() / 65536)
+        vb = 1.015 * (12490 / 2490) * 3.3 * (vb_pin.read_u16() / 65536)
+
+        vpot_in = 1.026 * 3.3 * (vpot_pin.read_u16() / 65536)
+        v_pot_filt[v_pot_index] = vpot_in
+        v_pot_index = v_pot_index + 1
+
+        if v_pot_index == 100:
+            v_pot_index = 0
+
+        vpot = sum(v_pot_filt) / 100
+
+        # ---------------------------------------------------------------------
+        # Existing INA219 current reading only
+        # ---------------------------------------------------------------------
+
+        Vshunt = ina.vshunt()
+        iL = Vshunt / SHUNT_OHMS
+        iL_abs = abs(iL)
+
+        CL = OL_CL_pin.value()
+        BU = BU_BO_pin.value()
+
+        # ---------------------------------------------------------------------
+        # Random pout_ref update every 5 seconds
+        # ---------------------------------------------------------------------
+
+        now_ms = time.ticks_ms()
+
+        if time.ticks_diff(now_ms, last_random_pout_ms) >= RANDOM_POUT_INTERVAL_MS:
+            pout_ref = RANDOM_POUT_MIN + (random.random() * (RANDOM_POUT_MAX - RANDOM_POUT_MIN))
+            last_random_pout_ms = now_ms
+            print("New random pout_ref = {:.3f} W".format(pout_ref))
+
+        # PWM limits based on capacitor maximum voltage
+        min_pwm = 65536 * vb / CAP_V_MAX
+        max_pwm = 64536
+
+        pwm_ref = saturate(
+            65536 - int((vpot / 3.3) * 65536),
+            max_pwm,
+            min_pwm,
+        )
+
+        # B-side output power measurement
+        pout_meas_B = vb * iL
+
+        if CL != 1:
+            p_ref = saturate((vpot - 1.66) * 2, MAX_POUT_REF, -MAX_POUT_REF)
+
+            if va <= CAP_V_MIN and p_ref > 0:
+                p_ref = 0
+
+            if va >= CAP_V_MAX and p_ref < 0:
+                p_ref = 0
+
+            p_err = pout_meas_B - p_ref
+            p_err_int = p_err_int + p_err
+            p_err_int = saturate(p_err_int, max_pwm / 300, min_pwm / 300)
+            p_pi_out = (100 * p_err) + (300 * p_err_int)
+
+            pwm_out = saturate(p_pi_out, max_pwm, min_pwm)
+            duty = int(65536 - pwm_out)
+            pwm.duty_u16(duty)
+
+            safe_pout_ref = p_ref
+            cap_mode = "OPEN_LOOP"
+
+        else:
+            if va < CAP_V_MIN:
+                safe_pout_ref = PRECHARGE_POUT
+                cap_mode = "PRECHARGE"
+
+            else:
+                safe_pout_ref = saturate(pout_ref, MAX_POUT_REF, -MAX_POUT_REF)
+                cap_mode = "NORMAL"
+
+            if va <= CAP_V_MIN and safe_pout_ref > 0:
+                safe_pout_ref = 0
+                cap_mode = "LOW_V_BLOCK_DISCHARGE"
+
+            if va >= CAP_V_MAX and safe_pout_ref < 0:
+                safe_pout_ref = 0
+                cap_mode = "HIGH_V_BLOCK_CHARGE"
+
+            if vb > 1.0:
+                i_ref = saturate(safe_pout_ref / vb, MAX_I_REF, -MAX_I_REF)
+            else:
+                i_ref = 0
+
+            i_err = i_ref - iL
+            i_err_int = i_err_int + i_err
+            i_err_int = saturate(i_err_int, max_pwm / 300, min_pwm / 300)
+            i_pi_out = (kp * i_err) + (ki * i_err_int)
+
+            pwm_out = saturate(i_pi_out, max_pwm, min_pwm)
+            duty = int(65536 - pwm_out)
+            pwm.duty_u16(duty)
+
+        count = count + 1
+        timer_elapsed = 0
+
+        if count > 100:
+            print("Va = {:.3f}".format(va))
+            print("Vb = {:.3f}".format(vb))
+            print("Vpot = {:.3f}".format(vpot))
+
+            print("iL = {:.3f}".format(iL))
+            print("|iL| = {:.3f}".format(iL_abs))
+            print("pout_meas_B = {:.3f}".format(pout_meas_B))
+
+            print("OC = {:b}".format(OC))
+            print("CL = {:b}".format(CL))
+            print("BU = {:b}".format(BU))
+            print("duty = {:d}".format(duty))
+
+            print("i_ref = {:.3f}".format(i_ref))
+            print("i_err = {:.3f}".format(i_err))
+            print("i_err_int = {:.3f}".format(i_err_int))
+            print("i_pi_out = {:.3f}".format(i_pi_out))
+
+            print("pout_ref = {:.3f}".format(pout_ref))
+            print("safe_pout_ref = {:.3f}".format(safe_pout_ref))
+            print("cap_mode = {}".format(cap_mode))
+
+            print("pwm_out = {:.3f}".format(pwm_out))
+            print("min_pwm = {:.3f}".format(min_pwm))
+
+            count = 0
